@@ -167,6 +167,7 @@ body.dark .brand h2{color:#e6edf6}body.dark .logo-l{background:#fff;border-radiu
         <option value="transparent">Transparent</option><option value="color">Couleur…</option></select>
         <input id="bgcolor" type="color" value="#ffffff" aria-label="Couleur du fond"></div>
       <label>Tolérance (détection simple) <output id="ot">40</output><input id="tol" type="range" min="5" max="120" value="40"></label>
+      <label class="chk"><input id="autobg" type="checkbox" checked> 🪄 Suppression automatique à l'ajout (comme remove.bg)</label>
       <button id="ai">✨ Détourage IA (local)</button>
       <button id="brush" class="big">🖌️ DÉTOURAGE MANUEL (baguette + pinceau)</button>
     </details>
@@ -302,13 +303,23 @@ function load(f) {
 }
 async function addFiles(files) {
   busy(true); await tick();
-  let n = 0;
+  let n = 0; const added = [];
   for (const f of files) {
-    try { S.photos.push({ canvas: await load(f), adj: DEF(), copies: 1 }); S.cur = S.photos.length - 1; n++; }
+    try { const ph = { canvas: await load(f), adj: DEF(), copies: 1 }; S.photos.push(ph); added.push(ph); S.cur = S.photos.length - 1; n++; }
     catch { toast('Format non lisible (HEIC non supporté ici ?). Utilisez JPG/PNG ou réglez l\'appareil sur "Le plus compatible".', true); }
   }
   busy(false);
   if (n) { toast('Photo ajoutée avec succès ✓'); syncUI(); refresh(); }
+  if (n && $('autobg').checked && window.isSecureContext) {
+    busy(true);
+    for (let i = 0; i < added.length; i++) {
+      const label = `Suppression du fond ${i + 1}/${added.length}… `;
+      $('loader').textContent = label;
+      try { await aiCut(added[i], label); } catch { /* silencieux : bouton manuel dispo si le modèle échoue */ }
+    }
+    $('loader').textContent = 'Traitement…'; busy(false);
+    syncUI(); refresh();
+  }
 }
 $('fcam').onchange = e => { addFiles([...e.target.files]); e.target.value = ''; };
 $('ffile').onchange = e => { addFiles([...e.target.files]); e.target.value = ''; };
@@ -557,24 +568,31 @@ $('cfull').onclick = () => { const a = setAdj(); a.crop = null; $('cropbox').hid
 $('cno').onclick = () => $('cropbox').hidden = true;
 
 /* ---------- Détourage IA local (@imgly/background-removal, WASM dans le navigateur) ----------
-   Les photos ne quittent pas l'appareil. Seul le modèle (~40 Mo) est téléchargé au 1er usage, puis mis en cache. */
+   Les photos ne quittent pas l'appareil. Seul le modèle (~40 Mo) est téléchargé au 1er usage, puis mis en cache.
+   aiCut() est réutilisée par le bouton manuel ET par la suppression automatique à l'ajout (style remove.bg). */
+let bgMod = null;
+const loadBgRemoval = () => bgMod || (bgMod = import('https://cdn.jsdelivr.net/npm/@imgly/background-removal@1.5.5/+esm'));
+async function aiCut(p, label) {
+  if (!window.isSecureContext) throw new Error('insecure');
+  const limit = ms => new Promise((_, ko) => setTimeout(ko, ms));
+  const { removeBackground } = await Promise.race([loadBgRemoval(), limit(20000)]);
+  const blob = await new Promise(r => p.canvas.toBlob(r, 'image/png'));
+  const out = await Promise.race([removeBackground(blob, { progress: (k, c, t) => { if (t) $('loader').textContent = label + Math.round(100 * c / t) + '%'; } }), limit(180000)]);
+  const im = new Image(), u = URL.createObjectURL(out);
+  await new Promise((ok, ko) => { im.onload = ok; im.onerror = ko; im.src = u; });
+  const c = mk(p.canvas.width, p.canvas.height); c.getContext('2d').drawImage(im, 0, 0, c.width, c.height); URL.revokeObjectURL(u);
+  p.cut = c; p.adj.ai = true; if (p.adj.bg === 'none') p.adj.bg = 'white';
+}
 $('ai').onclick = async () => {
   const p = cur(); if (!p) return toast('Ajoutez d\'abord une photo.', true);
   if (!window.isSecureContext) return toast('Détourage IA indisponible en fichier local (HTTPS requis). Utilisez 🖌️ Détourage manuel.', true);
-  const limit = ms => new Promise((_, ko) => setTimeout(ko, ms));
   $('loader').textContent = 'Détourage IA… téléchargement du modèle'; busy(true);
-  try {
-    const { removeBackground } = await Promise.race([import('https://cdn.jsdelivr.net/npm/@imgly/background-removal@1.5.5/+esm'), limit(20000)]);
-    const blob = await new Promise(r => p.canvas.toBlob(r, 'image/png'));
-    const out = await Promise.race([removeBackground(blob, { progress: (k, c, t) => { if (t) $('loader').textContent = 'Détourage IA… ' + Math.round(100 * c / t) + '%'; } }), limit(180000)]);
-    const im = new Image(), u = URL.createObjectURL(out);
-    await new Promise((ok, ko) => { im.onload = ok; im.onerror = ko; im.src = u; });
-    const c = mk(p.canvas.width, p.canvas.height); c.getContext('2d').drawImage(im, 0, 0, c.width, c.height); URL.revokeObjectURL(u);
-    setAdj(); p.cut = c; p.adj.ai = true; if (p.adj.bg === 'none') p.adj.bg = 'white';
-    syncUI(); refresh(); toast('Détourage IA terminé ✓');
-  } catch { toast('Détourage IA indisponible ou trop lent. Utilisez 🖌️ Détourage manuel.', true); }
+  try { setAdj(); await aiCut(p, 'Détourage IA… '); syncUI(); refresh(); toast('Détourage IA terminé ✓'); }
+  catch { toast('Détourage IA indisponible ou trop lent. Utilisez 🖌️ Détourage manuel.', true); }
   $('loader').textContent = 'Traitement…'; busy(false);
 };
+$('autobg').checked = localStorage.getItem('pps-autobg') !== '0';
+$('autobg').onchange = () => localStorage.setItem('pps-autobg', $('autobg').checked ? '1' : '0');
 
 /* ---------- Export PDF / PNG / Impression ---------- */
 const name = () => ($('fname').value.trim() || 'photos-impression').replace(/[\\/:*?"<>|]/g, '_');
